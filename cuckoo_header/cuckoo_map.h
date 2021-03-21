@@ -346,7 +346,7 @@ namespace libcuckoo {
         }
 
         int try_read_from_bucket( Bucket &b, const partial_t partial,
-                                  const char *key, size_type key_len) const {
+                                  const char *key, size_type key_len,partial_t * cnts) const {
 
             for (int i = 0; i < SLOT_PER_BUCKET; ++i) {
                 //block when kick
@@ -357,9 +357,9 @@ namespace libcuckoo {
                 while(is_kick_locked(entry));
 
                 partial_t read_partial = extract_partial(entry);
+                cnts[i] = read_partial;
                 Item * read_ptr = extract_ptr(entry);
-                if (read_ptr ==  nullptr ||
-                    (partial != read_partial)) {
+                if (read_ptr ==  nullptr) {
                     continue;
                 } else if (KeyEqual()(ITEM_KEY(read_ptr), ITEM_KEY_LEN(read_ptr), key, key_len)) {
                     return i;
@@ -368,17 +368,45 @@ namespace libcuckoo {
             return -1;
         }
 
+        bool cnt_changed(partial_t * cnt1, partial_t * cnt2)const {
+            for(size_t i =0; i < 2 * SLOT_PER_BUCKET; i++){
+                if(cnt1[i] - cnt2[i] >=2 || cnt2[i] - cnt1[i])
+                    return true;
+            }
+            return false;
+        }
+
         table_position cuckoo_find(const char *key, size_type key_len, const partial_t partial,
                                    const size_type i1, const size_type i2) const {
-            int slot = try_read_from_bucket(bc[i1], partial, key, key_len);
-            if (slot != -1) {
-                return table_position{i1, static_cast<size_type>(slot), ok};
+            partial_t cnts1[SLOT_PER_BUCKET * 2];
+            partial_t cnts2[SLOT_PER_BUCKET * 2];
+            while (true){
+                int slot = try_read_from_bucket(bc[i1], partial, key, key_len,cnts1);
+                if (slot != -1) {
+                    return table_position{i1, static_cast<size_type>(slot), ok};
+                }
+
+                slot = try_read_from_bucket(bc[i2], partial, key, key_len,cnts1+SLOT_PER_BUCKET);
+                if (slot != -1) {
+                    return table_position{i2, static_cast<size_type>(slot), ok};
+                }
+
+                //round two
+                slot = try_read_from_bucket(bc[i1], partial, key, key_len,cnts2);
+                if (slot != -1) {
+                    return table_position{i1, static_cast<size_type>(slot), ok};
+                }
+
+                slot = try_read_from_bucket(bc[i2], partial, key, key_len,cnts2+SLOT_PER_BUCKET);
+                if (slot != -1) {
+                    return table_position{i2, static_cast<size_type>(slot), ok};
+                }
+
+                if(!cnt_changed(cnts1,cnts2))
+                    return table_position{0, 0, failure_key_not_found};
             }
-            slot = try_read_from_bucket(bc[i2], partial, key, key_len);
-            if (slot != -1) {
-                return table_position{i2, static_cast<size_type>(slot), ok};
-            }
-            return table_position{0, 0, failure_key_not_found};
+
+
         }
 
         //false : key_duplicated. the slot is the position of deplicated key
