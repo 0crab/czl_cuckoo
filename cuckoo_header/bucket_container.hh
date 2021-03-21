@@ -80,7 +80,7 @@ namespace libcuckoo {
 
 
             bool empty() {
-                ASSERT(!table_anaz_mtx.try_lock(), "Bucket.empty need to be locked before call!");
+                //ASSERT(!table_anaz_mtx.try_lock(), "Bucket.empty need to be locked before call!");
                 for (size_type i = 0; i < SLOT_PER_BUCKET; i++) {
                     if (values_[i].load() != (uint64_t) nullptr)
                         return false;

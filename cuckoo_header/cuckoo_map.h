@@ -64,6 +64,7 @@ namespace libcuckoo {
         struct table_position {
             size_type index;
             size_type slot;
+            //uint64_t entry;
             cuckoo_status status;
         };
 
@@ -377,6 +378,11 @@ namespace libcuckoo {
             ;
         }
 
+        inline bool check_ptr(Item * ptr, char *key, size_type key_len) {
+            if (ptr == nullptr) return false;
+            return str_equal_to()(ITEM_KEY(ptr), ITEM_KEY_LEN(ptr), key, key_len);
+        }
+
     public:
         Cuckoohash_map(size_type hp = DEFAULT_HASHPOWER,int thread_num=0):
                     cuckoo_thread_num(thread_num),
@@ -424,27 +430,29 @@ namespace libcuckoo {
                 //do some thing
                 uint64_t entry = bc.read_from_bucket_slot(pos.index,pos.slot);
                 Item * ptr = extract_ptr(entry);
-                bool a = str_equal_to()(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr),key,key_len);
-                ASSERT(a,"key error");
+                if(ptr != nullptr)
+                    return str_equal_to()(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr),key,key_len);
+                //ASSERT(a,"key error");
 
-                return true;
+                return false;
             }
             return false;
         }
 
         //true insert , false key failure_key_duplicated
         bool insert(char *key, size_t key_len, char *value, size_t value_len){
+
+            Item * item = bc.allocate_item(key,key_len,value,value_len);
+            const hash_value hv = hashed_key(key, key_len);
+
             while(true){
-                //Item *item = allocate_item(key, key_len, value, value_len);
-                Item * item = bc.allocate_item(key,key_len,value,value_len);
-                const hash_value hv = hashed_key(key, key_len);
 
                 ParRegisterManager pm(block_when_rehashing(hv));
 
                 TwoBuckets b = get_two_buckets(hv);
-                table_position pos;
                 size_type old_hashpower = hashpower();
 
+                table_position pos;
                 try {
 
                     EpochManager epochManager(bc);
@@ -495,10 +503,74 @@ namespace libcuckoo {
         }
 
         //true insert , false update
-        bool insert_or_assign(char *key, size_t key_len, char *value, size_t value_len){;}
+        bool insert_or_assign(char *key, size_t key_len, char *value, size_t value_len){
+            //Item *item = allocate_item(key, key_len, value, value_len);
+            Item * item = bc.allocate_item(key,key_len,value,value_len);
+            const hash_value hv = hashed_key(key, key_len);
+
+            while (true) {
+                //protect from kick
+                ParRegisterManager pm(block_when_rehashing(hv));
+
+                TwoBuckets b = get_two_buckets(hv);
+
+                table_position pos;
+                {
+                    EpochManager epochManager(bc);
+                    pos = cuckoo_insert_loop(hv, b, key, key_len);
+                }
+
+                if (pos.status == ok) {
+                    if (bc.try_update_entry(pos.index, pos.slot,empty_entry,merge_par_ptr(hv.partial, (uint64_t) item))) {
+                        return true;
+                    }
+                } else {
+                    uint64_t old_entry = bc.read_from_bucket_slot(pos.index,pos.slot);
+                    Item * old_ptr = extract_ptr(old_entry);
+
+                    //We only confirm to update target key.
+                    //Regardless of whether the original key has been replaced at the position indicated by pos
+                    //try_update_entry function will deallocate the old entry if CAS success.
+                    if (check_ptr(old_ptr, key, key_len)) {
+                        if (bc.try_update_entry(pos.index, pos.slot,old_entry,merge_par_ptr(hv.partial, (uint64_t) item))) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
 
         //true erase success, false miss
-        bool erase(char *key, size_t key_len){;}
+        bool erase(char *key, size_t key_len){
+            const hash_value hv = hashed_key(key, key_len);
+
+            while (true) {
+
+                //protect from kick
+                ParRegisterManager pm(block_when_rehashing(hv));
+
+                TwoBuckets b = get_two_buckets(hv);
+
+                table_position pos;
+                {
+                    EpochManager epochManager(bc);
+                    pos = cuckoo_find(key, key_len, hv.partial, b.i1, b.i2);
+                }
+
+                if (pos.status == ok) {
+                    uint64_t old_entry = bc.read_from_bucket_slot(pos.index,pos.slot);
+                    Item * erase_ptr = extract_ptr(old_entry);
+                    if (check_ptr(erase_ptr, key, key_len)) {
+                        if (bc.try_update_entry(pos.index, pos.slot, old_entry,empty_entry )) {
+                            return true;
+                        }
+                    }
+                } else {
+                    //return false only when key not find
+                    return false;
+                }
+            }
+        }
 
 
     private:
