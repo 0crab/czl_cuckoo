@@ -10,9 +10,10 @@
 
 thread_local size_t kick_num_l,
         depth0_l, // ready to kick, then find empty slot
+        kick_lock_failure_other_lock_l,
         kick_lock_failure_data_check_l,
         kick_lock_failure_haza_check_l,
-        kick_lock_failure_other_lock_l,
+        kick_lock_failure_cas_failure_l,
         kick_lock_failure_haza_check_after_l,
         kick_lock_failure_data_check_after_l,
         key_duplicated_after_kick_l;
@@ -188,12 +189,154 @@ namespace libcuckoo {
             BC & bc_;
         };
 
+        // CuckooRecord holds one position in a cuckoo path. Since cuckoopath
+        // elements only define a sequence of alternate hashings for different hash
+        // values, we only need to keep track of the hash values being moved, rather
+        // than the keys themselves.
+        typedef struct {
+            size_type bucket;
+            size_type slot;
+            hash_value hv;
+        } CuckooRecord;
+
+        // The maximum number of items in a cuckoo BFS path. It determines the
+        // maximum number of slots we search when cuckooing.
+        static constexpr uint8_t MAX_BFS_PATH_LEN = 5;
+
+        // An array of CuckooRecords
+        using CuckooRecords = std::array<CuckooRecord, MAX_BFS_PATH_LEN>;
+
+        // A constexpr version of pow that we can use for various compile-time
+        // constants and checks.
+        static constexpr size_type const_pow(size_type a, size_type b) {
+            return (b == 0) ? 1 : a * const_pow(a, b - 1);
+        }
+
+        // b_slot holds the information for a BFS path through the table.
+        struct b_slot {
+            // The bucket of the last item in the path.
+            size_type bucket;
+            // a compressed representation of the slots for each of the buckets in
+            // the path. pathcode is sort of like a base-slot_per_bucket number, and
+            // we need to hold at most MAX_BFS_PATH_LEN slots. Thus we need the
+            // maximum pathcode to be at least slot_per_bucket()^(MAX_BFS_PATH_LEN).
+            uint16_t pathcode;
+            //TODO directly comment , maybe existing problem
+//            static_assert(const_pow(slot_per_bucket(), MAX_BFS_PATH_LEN) <
+//                          std::numeric_limits<decltype(pathcode)>::max(),
+//                          "pathcode may not be large enough to encode a cuckoo "
+//                          "path");
+            // The 0-indexed position in the cuckoo path this slot occupies. It must
+            // be less than MAX_BFS_PATH_LEN, and also able to hold negative values.
+            int8_t depth;
+            static_assert(MAX_BFS_PATH_LEN - 1 <=
+                          std::numeric_limits<decltype(depth)>::max(),
+                          "The depth type must able to hold a value of"
+                          " MAX_BFS_PATH_LEN - 1");
+            static_assert(-1 >= std::numeric_limits<decltype(depth)>::min(),
+                          "The depth type must be able to hold a value of -1");
+            b_slot() {}
+            b_slot(const size_type b, const uint16_t p, const decltype(depth) d)
+                    : bucket(b), pathcode(p), depth(d) {
+                assert(d < MAX_BFS_PATH_LEN);
+            }
+        };
+
+        // b_queue is the queue used to store b_slots for BFS cuckoo hashing.
+        class b_queue {
+        public:
+            b_queue() noexcept : first_(0), last_(0) {}
+
+            void enqueue(b_slot x) {
+                assert(!full());
+                slots_[last_++] = x;
+            }
+
+            b_slot dequeue() {
+                assert(!empty());
+                assert(first_ < last_);
+                b_slot &x = slots_[first_++];
+                return x;
+            }
+
+            bool empty() const { return first_ == last_; }
+
+            bool full() const { return last_ == MAX_CUCKOO_COUNT; }
+
+        private:
+            // The size of the BFS queue. It holds just enough elements to fulfill a
+            // MAX_BFS_PATH_LEN search for two starting buckets, with no circular
+            // wrapping-around. For one bucket, this is the geometric sum
+            // sum_{k=0}^{MAX_BFS_PATH_LEN-1} slot_per_bucket()^k
+            // = (1 - slot_per_bucket()^MAX_BFS_PATH_LEN) / (1 - slot_per_bucket())
+            //
+            // Note that if slot_per_bucket() == 1, then this simply equals
+            // MAX_BFS_PATH_LEN.
+
+            //TODO directly comment , maybe existing problem
+//            static_assert(slot_per_bucket() > 0,
+//                          "SLOT_PER_BUCKET must be greater than 0.");
+//            static constexpr size_type MAX_CUCKOO_COUNT =
+//                    2 * ((slot_per_bucket() == 1)
+//                         ? MAX_BFS_PATH_LEN
+//                         : (const_pow(slot_per_bucket(), MAX_BFS_PATH_LEN) - 1) /
+//                           (slot_per_bucket() - 1));
+            static const int  MAX_CUCKOO_COUNT = 682;
+            // An array of b_slots. Since we allocate just enough space to complete a
+            // full search, we should never exceed the end of the array.
+            b_slot slots_[MAX_CUCKOO_COUNT];
+            // The index of the head of the queue in the array
+            size_type first_;
+            // One past the index of the last_ item of the queue in the array.
+            size_type last_;
+        };
+
 
         inline bool is_kick_locked(uint64_t entry) const { return kick_lock_mask & entry ;}
-        inline bool try_kick_lock_entry(std::atomic<uint64_t> & atomic_par_ptr){ASSERT(false,"not implement yet")}
-        inline void kick_unlock_entry(std::atomic<uint64_t> & atomic_par_ptr){ASSERT(false,"not implement yet")}
-        bool kick_lock(size_type bucket_index, size_type slot){ASSERT(false,"not implement yet")}
-        void kick_unlock(size_type bucket_index, size_type slot){ASSERT(false,"not implement yet")}
+
+        bool kick_lock(size_type bucket_index, size_type slot){
+
+            while(true){
+
+                uint64_t entry = bc.read_from_bucket_slot(bucket_index,slot);
+                Item * ptr = extract_ptr(entry);
+
+                if(is_kick_locked(entry)){
+                    kick_lock_failure_other_lock_l++;
+                    continue;
+                }
+
+                if(ptr == nullptr){
+                    kick_lock_failure_data_check_l++;
+                    return false;
+                }else if(kickHazardKeyManager.inquiry_is_registerd(hashed_key(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr)).hash)){
+                    kick_lock_failure_haza_check_l++;
+                    continue;
+                }
+
+                if(!bc.try_update_entry(bucket_index,slot,entry,entry | kick_lock_mask)){
+                    kick_lock_failure_cas_failure_l++;
+                    continue;
+                }
+
+                if(kickHazardKeyManager.inquiry_is_registerd(hashed_key(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr)).hash)){
+                    bool a = bc.try_update_entry(bucket_index,slot,entry | kick_lock_mask ,entry);
+                    ASSERT(a,"unlock failure");
+                    kick_unlock(bucket_index,slot);
+                    kick_lock_failure_haza_check_after_l++;
+                    continue;
+                }
+
+                return true;
+            }
+
+        }
+        void kick_unlock(size_type bucket_index, size_type slot){
+            uint64_t entry = bc.read_from_bucket_slot(bucket_index,slot);
+            ASSERT(is_kick_locked(entry),"try kick unlock an unlocked par_ptr ");
+            bool res = bc.try_update_entry(bucket_index,slot,entry, entry & ~kick_lock_mask);
+            ASSERT(res,"unlock failure")
+        }
 
         TwoBuckets get_two_buckets(const hash_value &hv) const {
             const size_type hp = hashpower();
@@ -271,10 +414,233 @@ namespace libcuckoo {
             return true;
         }
 
+
+        // slot_search searches for a cuckoo path using breadth-first search. It
+        // starts with the i1 and i2 buckets, and, until it finds a bucket with an
+        // empty slot, adds each slot of the bucket in the b_slot. If the queue runs
+        // out of space, it fails.
+        //
+        // throws hashpower_changed if it changed during the search
+        b_slot slot_search(const size_type hp, const size_type i1,
+                           const size_type i2) {
+            b_queue q;
+            // The initial pathcode informs cuckoopath_search which bucket the path
+            // starts on
+            q.enqueue(b_slot(i1, 0, 0));
+            q.enqueue(b_slot(i2, 1, 0));
+            while (!q.empty()) {
+                b_slot x = q.dequeue();
+                Bucket &b = bc[x.bucket];
+                // Picks a (sort-of) random slot to start from
+                size_type starting_slot = x.pathcode % SLOT_PER_BUCKET;
+                for (size_type i = 0; i < SLOT_PER_BUCKET; ++i) {
+                    uint16_t slot = (starting_slot + i) % SLOT_PER_BUCKET;
+
+                    //block when kick locked
+                    uint64_t entry;
+                    do{
+                        entry = bc.read_from_slot(b,slot);
+                    } while (is_kick_locked(entry));
+
+                    partial_t kick_partial = extract_partial(entry);
+
+                    if (entry == empty_entry) {
+                        // We can terminate the search here
+                        x.pathcode = x.pathcode * SLOT_PER_BUCKET + slot;
+                        return x;
+                    }
+
+                    // If x has less than the maximum number of path components,
+                    // have come from if we kicked out the item at this slot.
+                    // create a new b_slot item, that represents the bucket we would
+                    //const partial_t partial = b.partial(slot);
+                    if (x.depth < MAX_BFS_PATH_LEN - 1) {
+                        assert(!q.full());
+                        b_slot y(alt_index(hp, kick_partial, x.bucket),
+                                 x.pathcode * SLOT_PER_BUCKET + slot, x.depth + 1);
+                        q.enqueue(y);
+                    }
+                }
+            }
+            // We didn't find a short-enough cuckoo path, so the search terminated.
+            // Return a failure value.
+            return b_slot(0, 0, -1);
+        }
+
+        int cuckoopath_search(const size_type hp, CuckooRecords &cuckoo_path,
+                              const size_type i1, const size_type i2) {
+            b_slot x = slot_search(hp, i1, i2);
+            if (x.depth == -1) {
+                return -1;
+            }
+            // Fill in the cuckoo path slots from the end to the beginning.
+            for (int i = x.depth; i >= 0; i--) {
+                cuckoo_path[i].slot = x.pathcode % SLOT_PER_BUCKET;
+                x.pathcode /= SLOT_PER_BUCKET;
+            }
+            // Fill in the cuckoo_path buckets and keys from the beginning to the
+            // end, using the final pathcode to figure out which bucket the path
+            // starts on. Since data could have been modified between slot_search
+            // and the computation of the cuckoo path, this could be an invalid
+            // cuckoo_path.
+            CuckooRecord &first = cuckoo_path[0];
+            if (x.pathcode == 0) {
+                first.bucket = i1;
+            } else {
+                assert(x.pathcode == 1);
+                first.bucket = i2;
+            }
+            {
+
+                Bucket &b = bc[first.bucket];
+
+                //block when kick locked
+                uint64_t entry;
+                do{
+                    entry = bc.read_from_slot(b,first.slot);
+                } while (is_kick_locked(entry));
+
+                Item * ptr = extract_ptr(entry);
+
+                if (entry == empty_entry) {
+                    // We can terminate here
+                    return 0;
+                }
+                first.hv = hashed_key(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr));
+            }
+            for (int i = 1; i <= x.depth; ++i) {
+                CuckooRecord &curr = cuckoo_path[i];
+                const CuckooRecord &prev = cuckoo_path[i - 1];
+                assert(prev.bucket == index_hash(hp, prev.hv.hash) ||
+                       prev.bucket ==
+                       alt_index(hp, prev.hv.partial, index_hash(hp, prev.hv.hash)));
+                // We get the bucket that this slot is on by computing the alternate
+                // index of the previous bucket
+                curr.bucket = alt_index(hp, prev.hv.partial, prev.bucket);
+                //const auto lock_manager = lock_one(hp, curr.bucket, TABLE_MODE());
+                Bucket &b = bc[curr.bucket];
+
+                //block when kick locked
+                uint64_t entry;
+                do{
+                    entry = bc.read_from_slot(b,curr.slot);
+                } while (is_kick_locked(entry));
+
+                Item * ptr = extract_ptr(entry);
+
+
+                if (entry == empty_entry) {
+                    // We can terminate here
+                    return i;
+                }
+                curr.hv = hashed_key(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr));
+            }
+            return x.depth;
+        }
+
+        bool cuckoopath_move(const size_type hp, CuckooRecords &cuckoo_path,
+                             size_type depth, TwoBuckets &b) {
+            if (depth == 0) {
+                // There is a chance that depth == 0, when try_add_to_bucket sees
+                // both buckets as full and cuckoopath_search finds one empty. In
+                // this case, we lock both buckets. If the slot that
+                // cuckoopath_search found empty isn't empty anymore, we unlock them
+                // and return false. Otherwise, the bucket is empty and insertable,
+                // so we hold the locks and return true.
+                depth0_l++;
+                const size_type bucket_i = cuckoo_path[0].bucket;
+                assert(bucket_i == b.i1 || bucket_i == b.i2);
+                //b = lock_two(hp, b.i1, b.i2, TABLE_MODE());
+
+                //block when kick locked
+                Bucket & b = bc[bucket_i];
+
+                size_type entry;
+                do{
+                    entry = bc.read_from_slot(b,cuckoo_path[0].slot);
+                } while (is_kick_locked(entry));
+
+                if (entry == empty_entry ){
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+
+            while (depth > 0) {
+                CuckooRecord &from = cuckoo_path[depth - 1];
+                CuckooRecord &to = cuckoo_path[depth];
+                const size_type fb = from.bucket;
+                const size_type tb = to.bucket;
+                const size_type fs = from.slot;
+                const size_type ts = to.slot;
+
+                //LockManager extra_manager;
+
+                if(!kick_lock(fb,fs))
+                    return false;
+
+                uint64_t mv_entry = bc.read_from_bucket_slot(fb,fs);
+                ASSERT(is_kick_locked(mv_entry)," kick lock false");
+                ASSERT(extract_ptr(mv_entry) != nullptr,"mv empty entry")
+
+                if(!bc.try_update_entry(tb,ts,empty_entry,mv_entry & ~kick_lock_mask)){
+                    kick_unlock(fb,fs);
+                    kick_lock_failure_data_check_after_l ++;
+                    return false;
+                }
+
+                bool res = bc.try_update_entry(fb,fs,mv_entry,empty_entry);
+                ASSERT(res,"kick rm from entry fail")
+
+                depth--;
+            }
+
+            return true;
+        }
+
         cuckoo_status run_cuckoo(TwoBuckets &b, size_type &insert_bucket,
                                  size_type &insert_slot) {
-            ASSERT(false,"not implement yet")
+            size_type hp = hashpower();
+            CuckooRecords cuckoo_path;
+            bool done = false;
+            try {
+                //LOOP CONTROL
+                size_t loop_count = 0;
+                while (!done) {
+                    loop_count ++;
+
+                    ASSERT(loop_count < 1000000,"MAYBE DEAD LOOP");
+                    const int depth =
+                            cuckoopath_search(hp, cuckoo_path, b.i1, b.i2);
+
+                    kick_path_length_log_l[depth]++;
+                    if (depth < 0) {
+                        break;
+                    }
+
+                    //show_cuckoo_path(cuckoo_path,depth);
+
+                    if (cuckoopath_move(hp, cuckoo_path, depth, b)) {
+                        insert_bucket = cuckoo_path[0].bucket;
+                        insert_slot = cuckoo_path[0].slot;
+
+                        assert(insert_bucket == b.i1 || insert_bucket == b.i2);
+
+                        done = true;
+                        break;
+                    }
+                }
+            } catch (hashpower_changed &) {
+                // The hashpower changed while we were trying to cuckoo, which means
+                // we want to retry. b.i1 and b.i2 should not be locked
+                // in this case.
+                return failure_under_expansion;
+            }
+            return done ? ok : failure;
         }
+
+
         table_position cuckoo_insert(const hash_value hv, TwoBuckets &b, char *key, size_type key_len) {
             int res1, res2;
             Bucket &b1 = bc[b.i1];
@@ -313,6 +679,7 @@ namespace libcuckoo {
                 table_position pos = cuckoo_find(key,key_len, hv.partial, b.i1, b.i2);
                 if (pos.status == ok) {
                     pos.status = failure_key_duplicated;
+                    key_duplicated_after_kick_l++;
                     return pos;
                 }
                 return table_position{insert_bucket, insert_slot, ok};
@@ -332,9 +699,10 @@ namespace libcuckoo {
                     case failure_key_duplicated:
                         return pos;
                     case failure_table_full:
+                        ASSERT(false,"table full,need rehash");
                         throw need_rehash();
 
-                        ASSERT(false,"table full,need rehash");
+
                         // Expand the table and try again, re-grabbing the locks
                         //cuckoo_fast_double<TABLE_MODE, automatic_resize>(hp);
                         //b = snapshot_and_lock_two<TABLE_MODE>(hv);
@@ -502,6 +870,7 @@ namespace libcuckoo {
 
         }
 
+        //TODO insert or assign also need rehash interface
         //true insert , false update
         bool insert_or_assign(char *key, size_t key_len, char *value, size_t value_len){
             //Item *item = allocate_item(key, key_len, value, value_len);
@@ -533,6 +902,7 @@ namespace libcuckoo {
                     //try_update_entry function will deallocate the old entry if CAS success.
                     if (check_ptr(old_ptr, key, key_len)) {
                         if (bc.try_update_entry(pos.index, pos.slot,old_entry,merge_par_ptr(hv.partial, (uint64_t) item))) {
+                            bc.deallocate(old_ptr);
                             return false;
                         }
                     }

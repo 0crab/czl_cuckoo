@@ -76,6 +76,7 @@ static size_t kick_num,
 kick_lock_failure_data_check,
         kick_lock_failure_haza_check,
         kick_lock_failure_other_lock,
+        kick_lock_failure_cas_failure,
         kick_lock_failure_haza_check_after,
         kick_lock_failure_data_check_after,
         key_duplicated_after_kick;
@@ -245,6 +246,7 @@ void insert_worker(int tid){
     __sync_fetch_and_add(&kick_lock_failure_data_check,kick_lock_failure_data_check_l);
     __sync_fetch_and_add(&kick_lock_failure_haza_check,kick_lock_failure_haza_check_l);
     __sync_fetch_and_add(&kick_lock_failure_other_lock,kick_lock_failure_other_lock_l);
+    __sync_fetch_and_add(&kick_lock_failure_cas_failure,kick_lock_failure_cas_failure_l);
     __sync_fetch_and_add(&kick_lock_failure_haza_check_after,kick_lock_failure_haza_check_after_l);
     __sync_fetch_and_add(&kick_lock_failure_data_check_after,kick_lock_failure_data_check_after_l);
     __sync_fetch_and_add(&key_duplicated_after_kick,key_duplicated_after_kick_l);
@@ -403,9 +405,10 @@ void show_info_insert(){
 
     cout << ">>>>>pre insert finish" <<"\tinsert_success: "<<insert_success<<"\tkick_num: "<<kick_num<< endl;
     cout<<"depth0 "<<depth0<<endl;
+    cout<<"kick_lock_failure_other_lock "<<kick_lock_failure_other_lock<<endl;
     cout<<"kick_lock_failure_data_check "<<kick_lock_failure_data_check<<endl;
     cout<<"kick_lock_failure_haza_check "<<kick_lock_failure_haza_check<<endl;
-    cout<<"kick_lock_failure_other_lock "<<kick_lock_failure_other_lock<<endl;
+    cout<<"kick_lock_failure_cas_failure "<<kick_lock_failure_cas_failure<<endl;
     cout<<"kick_lock_failure_haza_check_after "<<kick_lock_failure_haza_check_after<<endl;
     cout<<"kick_lock_failure_data_check_after "<<kick_lock_failure_data_check_after<<endl;
     cout<<"key_duplicated_after_kick "<<key_duplicated_after_kick<<endl;

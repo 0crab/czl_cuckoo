@@ -149,15 +149,12 @@ namespace libcuckoo {
 
         //do insert: just input old_entry = empty_entry;
         //do erase: just input update_entry = empty_entry;
-        //this function does not deallocate item when fail
+        //this function does not deallocate item
         bool try_update_entry(size_type ind, size_type slot, uint64_t old_entry, uint64_t update_entry) {
             Bucket &b = buckets_[ind];
             uint64_t old = b.values_[slot].load(std::memory_order_relaxed);
             if (old != old_entry) return false;
             if (b.values_[slot].compare_exchange_strong(old, update_entry)) {
-                Item *retire_ptr = extract_ptr(old);
-                if(retire_ptr != nullptr)
-                    deallocate(retire_ptr);
                 return true;
             } else {
                 return false;
