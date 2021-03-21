@@ -404,7 +404,7 @@ namespace libcuckoo {
 
         inline size_type slot_num(){return bc.get_slot_num();}
 
-        size_type get_item_num(){bc.get_item_num(true);}
+        size_type get_item_num(){ return bc.get_item_num(true);}
 
         void get_key_position_info(std::vector<double> & kpv){bc.get_key_position_info(kpv);}
 

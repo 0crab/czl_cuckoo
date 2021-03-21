@@ -172,7 +172,7 @@ namespace libcuckoo {
                 uint64_t count = 0;
                 for (size_t i = 0; i < get_size(); i++) {
                     Bucket &b = buckets_[i];
-                    for (int j = 0; j < SLOT_PER_BUCKET; j++) {
+                    for (size_t j = 0; j < SLOT_PER_BUCKET; j++) {
                         if (b.values_[j].load(std::memory_order_relaxed) != empty_entry) {
                             count++;
                         }
