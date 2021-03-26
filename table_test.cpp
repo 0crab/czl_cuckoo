@@ -74,12 +74,11 @@ static size_t erase_success, erase_failure;
 static size_t kick_num,
         depth0, // ready to kick, then find empty slot
 kick_lock_failure_data_check,
-        kick_lock_failure_haza_check,
         kick_lock_failure_other_lock,
         kick_lock_failure_cas_failure,
-        kick_lock_failure_haza_check_after,
         kick_lock_failure_data_check_after,
-        key_duplicated_after_kick;
+        key_duplicated_after_kick,
+        kick_send_redo_signal;
 
 size_t kick_path_length_log[6];
 
@@ -244,12 +243,11 @@ void insert_worker(int tid){
     __sync_fetch_and_add(&kick_num, kick_num_l);
     __sync_fetch_and_add(&depth0,depth0_l);
     __sync_fetch_and_add(&kick_lock_failure_data_check,kick_lock_failure_data_check_l);
-    __sync_fetch_and_add(&kick_lock_failure_haza_check,kick_lock_failure_haza_check_l);
     __sync_fetch_and_add(&kick_lock_failure_other_lock,kick_lock_failure_other_lock_l);
     __sync_fetch_and_add(&kick_lock_failure_cas_failure,kick_lock_failure_cas_failure_l);
-    __sync_fetch_and_add(&kick_lock_failure_haza_check_after,kick_lock_failure_haza_check_after_l);
     __sync_fetch_and_add(&kick_lock_failure_data_check_after,kick_lock_failure_data_check_after_l);
     __sync_fetch_and_add(&key_duplicated_after_kick,key_duplicated_after_kick_l);
+    __sync_fetch_and_add(&kick_send_redo_signal,kick_send_redo_signal_l);
 
     for(int i = 0; i < 6 ;i++){
         __sync_fetch_and_add(&kick_path_length_log[i],kick_path_length_log_l[i]);
@@ -407,11 +405,11 @@ void show_info_insert(){
     cout<<"depth0 "<<depth0<<endl;
     cout<<"kick_lock_failure_other_lock "<<kick_lock_failure_other_lock<<endl;
     cout<<"kick_lock_failure_data_check "<<kick_lock_failure_data_check<<endl;
-    cout<<"kick_lock_failure_haza_check "<<kick_lock_failure_haza_check<<endl;
     cout<<"kick_lock_failure_cas_failure "<<kick_lock_failure_cas_failure<<endl;
-    cout<<"kick_lock_failure_haza_check_after "<<kick_lock_failure_haza_check_after<<endl;
     cout<<"kick_lock_failure_data_check_after "<<kick_lock_failure_data_check_after<<endl;
     cout<<"key_duplicated_after_kick "<<key_duplicated_after_kick<<endl;
+    cout<<"kick_send_redo_signal "<<kick_send_redo_signal<<endl;
+
 
     cout<<"path length log:  ";
     for(int i = 0; i < 6;i++ ) {

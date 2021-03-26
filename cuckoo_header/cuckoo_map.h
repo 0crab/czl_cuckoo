@@ -12,11 +12,10 @@ thread_local size_t kick_num_l,
         depth0_l, // ready to kick, then find empty slot
         kick_lock_failure_other_lock_l,
         kick_lock_failure_data_check_l,
-        kick_lock_failure_haza_check_l,
         kick_lock_failure_cas_failure_l,
-        kick_lock_failure_haza_check_after_l,
         kick_lock_failure_data_check_after_l,
-        key_duplicated_after_kick_l;
+        key_duplicated_after_kick_l,
+        kick_send_redo_signal_l;
 thread_local size_t kick_path_length_log_l[6];
 
 
@@ -112,11 +111,18 @@ namespace libcuckoo {
         public:
 
             static const int ALIGN_RATIO = 128 / sizeof (size_type);
+            static const int ALIGN_RATIO_BOOL = 128 / sizeof (bool);
 
             KickHazardKeyManager(int thread_num) : running_thread_num(thread_num){
                 manager = new std::atomic<size_type>[running_thread_num * ALIGN_RATIO]();
-                for(int i = 0; i < running_thread_num * ALIGN_RATIO;i++)
+                redo_flags = new std::atomic<bool>[running_thread_num * ALIGN_RATIO_BOOL];
+                for(int i = 0; i < running_thread_num * ALIGN_RATIO;i++){
                     manager[i].store(0ul,std::memory_order_relaxed);
+                }
+                for(int i = 0; i < running_thread_num * ALIGN_RATIO_BOOL; i++ ){
+                    redo_flags[i].store(false,std::memory_order_relaxed);
+                }
+
             }
 
 
@@ -130,6 +136,26 @@ namespace libcuckoo {
                 }
                 return false;
             }
+
+            bool inquiry_need_redo(){
+                return redo_flags[cuckoo_tid * ALIGN_RATIO_BOOL].load(std::memory_order_seq_cst);
+            }
+
+            void clean_redo_flag(){
+                redo_flags[cuckoo_tid * ALIGN_RATIO_BOOL].store(false,std::memory_order_seq_cst);
+            }
+
+            void set_redo_if_hazard(size_type hash){
+                for(int i = 0; i < running_thread_num; i++){
+                    if(i == cuckoo_tid) continue;
+                    size_type store_record =  manager[i * ALIGN_RATIO].load(std::memory_order_seq_cst);
+                    if(is_handled(store_record) && equal_hash(store_record,hash)){
+                        redo_flags[i * ALIGN_RATIO_BOOL].store(true,std::memory_order_seq_cst);
+                        cout<<"thread "<<i<<" redo find"<<endl;
+                    }
+                }
+            }
+
 
             std::atomic<size_type> * register_hash(size_type hash) {
                 manager[cuckoo_tid * ALIGN_RATIO].store(con_store_record(hash),std::memory_order_seq_cst);
@@ -160,6 +186,8 @@ namespace libcuckoo {
             int running_thread_num;
 
             std::atomic<size_type>  * manager;
+
+            std::atomic<bool> * redo_flags;
 
             size_type hash_mask = ~0x1ul;
             size_type handle_mask = 0x1ul;
@@ -309,21 +337,10 @@ namespace libcuckoo {
                 if(ptr == nullptr){
                     kick_lock_failure_data_check_l++;
                     return false;
-                }else if(kickHazardKeyManager.inquiry_is_registerd(hashed_key(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr)).hash)){
-                    kick_lock_failure_haza_check_l++;
-                    continue;
                 }
 
                 if(!bc.try_update_entry(bucket_index,slot,entry,entry | kick_lock_mask)){
                     kick_lock_failure_cas_failure_l++;
-                    continue;
-                }
-
-                if(kickHazardKeyManager.inquiry_is_registerd(hashed_key(ITEM_KEY(ptr),ITEM_KEY_LEN(ptr)).hash)){
-                    bool a = bc.try_update_entry(bucket_index,slot,entry | kick_lock_mask ,entry);
-                    ASSERT(a,"unlock failure");
-                    kick_unlock(bucket_index,slot);
-                    kick_lock_failure_haza_check_after_l++;
                     continue;
                 }
 
@@ -350,11 +367,7 @@ namespace libcuckoo {
 
             for (int i = 0; i < SLOT_PER_BUCKET; ++i) {
                 //block when kick
-                size_type entry;
-                do{
-                    entry = bc.read_from_slot(b,i);
-                }
-                while(is_kick_locked(entry));
+                size_type entry = bc.read_from_slot(b,i);
 
                 partial_t read_partial = extract_partial(entry);
                 Item * read_ptr = extract_ptr(entry);
@@ -390,11 +403,7 @@ namespace libcuckoo {
             slot = -1;
             for (int i = 0; i < SLOT_PER_BUCKET; ++i) {
                 //block when kick
-                size_type entry;
-                do{
-                    entry = bc.read_from_slot(b,i);
-                }
-                while(is_kick_locked(entry));
+                size_type entry = bc.read_from_slot(b,i);
 
                 partial_t read_partial = extract_partial(entry);
                 Item * read_ptr = extract_ptr(entry);
@@ -437,10 +446,7 @@ namespace libcuckoo {
                     uint16_t slot = (starting_slot + i) % SLOT_PER_BUCKET;
 
                     //block when kick locked
-                    uint64_t entry;
-                    do{
-                        entry = bc.read_from_slot(b,slot);
-                    } while (is_kick_locked(entry));
+                    uint64_t entry = bc.read_from_slot(b,slot);
 
                     partial_t kick_partial = extract_partial(entry);
 
@@ -495,10 +501,7 @@ namespace libcuckoo {
                 Bucket &b = bc[first.bucket];
 
                 //block when kick locked
-                uint64_t entry;
-                do{
-                    entry = bc.read_from_slot(b,first.slot);
-                } while (is_kick_locked(entry));
+                uint64_t entry = bc.read_from_slot(b,first.slot);
 
                 Item * ptr = extract_ptr(entry);
 
@@ -520,14 +523,9 @@ namespace libcuckoo {
                 //const auto lock_manager = lock_one(hp, curr.bucket, TABLE_MODE());
                 Bucket &b = bc[curr.bucket];
 
-                //block when kick locked
-                uint64_t entry;
-                do{
-                    entry = bc.read_from_slot(b,curr.slot);
-                } while (is_kick_locked(entry));
+                uint64_t entry = bc.read_from_slot(b,curr.slot);
 
                 Item * ptr = extract_ptr(entry);
-
 
                 if (entry == empty_entry) {
                     // We can terminate here
@@ -555,10 +553,7 @@ namespace libcuckoo {
                 //block when kick locked
                 Bucket & b = bc[bucket_i];
 
-                size_type entry;
-                do{
-                    entry = bc.read_from_slot(b,cuckoo_path[0].slot);
-                } while (is_kick_locked(entry));
+                size_type entry = bc.read_from_slot(b,cuckoo_path[0].slot);
 
                 if (entry == empty_entry ){
                     return true;
@@ -584,11 +579,21 @@ namespace libcuckoo {
                 ASSERT(is_kick_locked(mv_entry)," kick lock false");
                 ASSERT(extract_ptr(mv_entry) != nullptr,"mv empty entry")
 
+                Item * mv_ptr = extract_ptr(mv_entry);
+                size_type mv_hash = hashed_key(ITEM_KEY(mv_ptr),ITEM_KEY_LEN(mv_ptr)).hash;
+                if( mv_hash != from.hv.hash){
+                    kick_unlock(fb,fs);
+                    kick_lock_failure_data_check_after_l ++;
+                    return false;
+                }
+
                 if(!bc.try_update_entry(tb,ts,empty_entry,mv_entry & ~kick_lock_mask)){
                     kick_unlock(fb,fs);
                     kick_lock_failure_data_check_after_l ++;
                     return false;
                 }
+
+                kickHazardKeyManager.set_redo_if_hazard(mv_hash);
 
                 bool res = bc.try_update_entry(fb,fs,mv_entry,empty_entry);
                 ASSERT(res,"kick rm from entry fail")
@@ -786,12 +791,13 @@ namespace libcuckoo {
 
             TwoBuckets b = get_two_buckets(hv);
 
+
             table_position pos;
-            {
+            do{
                 EpochManager epochManager(bc);
                 pos = cuckoo_find(key, key_len, hv.partial, b.i1, b.i2);
-            }
-
+            }while(pos.status == failure_key_not_found && kickHazardKeyManager.inquiry_need_redo());
+            kickHazardKeyManager.clean_redo_flag();
 
             if (pos.status == ok) {
                 EpochManager epochManager(bc);
@@ -822,10 +828,11 @@ namespace libcuckoo {
 
                 table_position pos;
                 try {
-
-                    EpochManager epochManager(bc);
-                    pos = cuckoo_insert_loop(hv, b, key, key_len);
-
+                    do{
+                        EpochManager epochManager(bc);
+                        pos = cuckoo_insert_loop(hv, b, key, key_len);
+                    }while(pos.status == failure_key_not_found && kickHazardKeyManager.inquiry_need_redo());
+                    kickHazardKeyManager.clean_redo_flag();
                 }catch (need_rehash){
 
                     pm.get()->store(0ul);
@@ -884,10 +891,11 @@ namespace libcuckoo {
                 TwoBuckets b = get_two_buckets(hv);
 
                 table_position pos;
-                {
+                do{
                     EpochManager epochManager(bc);
                     pos = cuckoo_insert_loop(hv, b, key, key_len);
-                }
+                }while(pos.status == failure_key_not_found && kickHazardKeyManager.inquiry_need_redo());
+                kickHazardKeyManager.clean_redo_flag();
 
                 if (pos.status == ok) {
                     if (bc.try_update_entry(pos.index, pos.slot,empty_entry,merge_par_ptr(hv.partial, (uint64_t) item))) {
@@ -895,6 +903,7 @@ namespace libcuckoo {
                     }
                 } else {
                     uint64_t old_entry = bc.read_from_bucket_slot(pos.index,pos.slot);
+                    if(is_kick_locked(old_entry)) continue;
                     Item * old_ptr = extract_ptr(old_entry);
 
                     //We only confirm to update target key.
@@ -922,13 +931,15 @@ namespace libcuckoo {
                 TwoBuckets b = get_two_buckets(hv);
 
                 table_position pos;
-                {
+                do{
                     EpochManager epochManager(bc);
                     pos = cuckoo_find(key, key_len, hv.partial, b.i1, b.i2);
-                }
+                }while(pos.status == failure_key_not_found && kickHazardKeyManager.inquiry_need_redo());
+                kickHazardKeyManager.clean_redo_flag();
 
                 if (pos.status == ok) {
                     uint64_t old_entry = bc.read_from_bucket_slot(pos.index,pos.slot);
+                    if(is_kick_locked(old_entry)) continue;
                     Item * erase_ptr = extract_ptr(old_entry);
                     if (check_ptr(erase_ptr, key, key_len)) {
                         if (bc.try_update_entry(pos.index, pos.slot, old_entry,empty_entry )) {
